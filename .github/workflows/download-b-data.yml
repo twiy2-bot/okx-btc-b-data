@@ -1,202 +1,71 @@
-
 name: Download OKX BTC B Sample
-
 on:
   workflow_dispatch:
-
+    inputs:
+      redownload_bad:
+        description: "断点中自检不合格的分片也重新下载"
+        type: boolean
+        default: false
 permissions:
   contents: read
-
+concurrency:
+  group: download-b-data
+  cancel-in-progress: false
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONUNBUFFERED: "1"
+  CKPT_KEY_PREFIX: b-ckpt-v2-${{ hashFiles('脚本/下载B样本.py') }}-
 jobs:
   download:
     runs-on: ubuntu-latest
     timeout-minutes: 300
-
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Install dependencies
-        run: pip install requests
-
+        run: pip install requests==2.32.3
+      - name: Offline tests
+        run: python 脚本/测试_下载B样本.py
+      - name: Restore checkpoint
+        uses: actions/cache/restore@v4
+        with:
+          path: 输出/断点
+          key: ${{ env.CKPT_KEY_PREFIX }}${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ env.CKPT_KEY_PREFIX }}
       - name: Download and audit B sample
-        shell: bash
+        env:
+          REDOWNLOAD_BAD: ${{ inputs.redownload_bad }}
         run: |
-          cat > download_b.py <<'PY'
-          import csv, time, hashlib, zipfile, os, threading
-          import requests
-          from concurrent.futures import ThreadPoolExecutor, as_completed
-          from datetime import datetime, timezone
-
-          URL = "https://www.okx.com/api/v5/market/history-candles"
-          STEP = 15 * 60 * 1000
-          START = int(datetime(2020,1,1,tzinfo=timezone.utc).timestamp()*1000)
-          END = int(datetime(2024,5,1,23,45,tzinfo=timezone.utc).timestamp()*1000)
-          FIELDS = ["ts","open","high","low","close","volume",
-                    "volume_ccy","volume_ccy_quote","confirm"]
-
-          # Eight non-overlapping time shards.
-          total = (END - START) // STEP + 1
-          shards = []
-          for i in range(8):
-              a = START + total * i // 8 * STEP
-              b = START + (total * (i+1) // 8 - 1) * STEP
-              shards.append((a,b))
-
-          rate_lock = threading.Lock()
-          last_request = [0.0]
-          count_lock = threading.Lock()
-          request_count = [0]
-
-          def rate_limit():
-              with rate_lock:
-                  now = time.monotonic()
-                  wait = 0.115 - (now - last_request[0])
-                  if wait > 0:
-                      time.sleep(wait)
-                  last_request[0] = time.monotonic()
-
-          def fetch_shard(item):
-              idx, (start, end) = item
-              session = requests.Session()
-              cursor = end + STEP
-              rows_by_ts = {}
-              pages = 0
-
-              while cursor > start:
-                  params = {
-                      "instId": "BTC-USDT",
-                      "bar": "15m",
-                      "after": str(cursor),
-                      "limit": "100"
-                  }
-
-                  for attempt in range(8):
-                      try:
-                          rate_limit()
-                          r = session.get(URL, params=params, timeout=35)
-                          r.raise_for_status()
-                          obj = r.json()
-                          if obj.get("code") != "0":
-                              raise RuntimeError(obj.get("msg"))
-                          data = obj.get("data", [])
-                          with count_lock:
-                              request_count[0] += 1
-                          break
-                      except Exception:
-                          if attempt == 7:
-                              raise
-                          time.sleep(min(2 ** attempt, 20))
-
-                  if not data:
-                      break
-
-                  ts_values = [int(x[0]) for x in data]
-                  oldest = min(ts_values)
-
-                  for row in data:
-                      ts = int(row[0])
-                      if start <= ts <= end:
-                          rows_by_ts[ts] = row
-
-                  pages += 1
-                  if pages % 100 == 0:
-                      print(f"Shard {idx+1}: {len(rows_by_ts)} rows")
-
-                  if oldest >= cursor:
-                      raise RuntimeError("Pagination cursor did not move")
-                  cursor = oldest
-                  if oldest <= start:
-                      break
-
-              session.close()
-              print(f"Shard {idx+1} complete: {len(rows_by_ts)} rows")
-              return rows_by_ts
-
-          all_rows = {}
-          with ThreadPoolExecutor(max_workers=4) as pool:
-              futures = [pool.submit(fetch_shard, x) for x in enumerate(shards)]
-              for f in as_completed(futures):
-                  part = f.result()
-                  overlap = set(all_rows).intersection(part)
-                  if overlap:
-                      raise RuntimeError(f"Shard overlap: {len(overlap)}")
-                  all_rows.update(part)
-
-          timestamps = sorted(all_rows)
-          expected = list(range(START, END+1, STEP))
-          missing = sorted(set(expected) - set(timestamps))
-          extra = sorted(set(timestamps) - set(expected))
-
-          rows = [all_rows[t] for t in timestamps]
-          bad = []
-          unconfirmed = []
-          for row in rows:
-              o,h,l,c = map(float, row[1:5])
-              v = list(map(float, row[5:8]))
-              if min(o,h,l,c) <= 0 or h < max(o,l,c) or l > min(o,h,c):
-                  bad.append(int(row[0]))
-              if min(v) < 0:
-                  bad.append(int(row[0]))
-              if str(row[8]) != "1":
-                  unconfirmed.append(int(row[0]))
-
-          os.makedirs("output", exist_ok=True)
-          csv_path = "output/BTC-USDT-15m-B-20200101-20240501.csv"
-          with open(csv_path, "w", newline="", encoding="utf-8") as f:
-              w = csv.writer(f)
-              w.writerow(FIELDS)
-              w.writerows(rows)
-
-          digest = hashlib.sha256(open(csv_path,"rb").read()).hexdigest()
-
-          report = f"""Source: OKX public history-candles API
-          Instrument: BTC-USDT spot
-          Bar: 15m
-          Start UTC: 2020-01-01 00:00
-          End UTC: 2024-05-01 23:45
-          Expected rows: {len(expected)}
-          Actual rows: {len(rows)}
-          Missing timestamps: {len(missing)}
-          Extra timestamps: {len(extra)}
-          Invalid OHLC/volume rows: {len(bad)}
-          Unconfirmed rows: {len(unconfirmed)}
-          API requests: {request_count[0]}
-          CSV SHA256: {digest}
-          """
-
-          with open("output/B数据审计摘要.txt","w",encoding="utf-8") as f:
-              f.write(report)
-
-          print(report)
-
-          if missing or extra or bad or unconfirmed or len(rows) != len(expected):
-              with open("output/缺失时间戳.csv","w") as f:
-                  w = csv.writer(f)
-                  w.writerow(["missing_ts"])
-                  w.writerows([[x] for x in missing])
-              raise RuntimeError("B sample audit FAILED; do not use as formal data")
-
-          with zipfile.ZipFile("output/B样本数据.zip","w",zipfile.ZIP_DEFLATED) as z:
-              z.write(csv_path, arcname=os.path.basename(csv_path))
-              z.write("output/B数据审计摘要.txt", arcname="B数据审计摘要.txt")
-
-          with open("output/SHA256.txt","w") as f:
-              f.write(digest + "  " + os.path.basename(csv_path) + "\n")
-
-          print("B SAMPLE DOWNLOAD AND AUDIT PASSED")
-          PY
-
-          python download_b.py
-
-      - name: Upload B sample artifact
-        if: success() || failure()
+          args=(--output 输出)
+          if [ "$REDOWNLOAD_BAD" = "true" ]; then
+            args+=(--redownload-bad)
+          fi
+          python 脚本/下载B样本.py "${args[@]}"
+      - name: Save checkpoint
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: 输出/断点
+          key: ${{ env.CKPT_KEY_PREFIX }}${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Upload deliverables and audit
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: OKX-B-Sample-2020-2024
-          path: output/
+          name: OKX-B-Sample-2020-2024-run${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            输出/交付/
+            输出/日志/
           if-no-files-found: warn
           retention-days: 30
-
+      - name: Upload raw responses
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OKX-B-Raw-run${{ github.run_number }}-${{ github.run_attempt }}
+          path: 输出/断点/
+          if-no-files-found: warn
+          retention-days: 30
